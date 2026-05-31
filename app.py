@@ -2,6 +2,7 @@ import os
 import ecdsa
 import streamlit as st
 import requests
+import hashlib
 from dotenv import load_dotenv  # 新增這一行
 
 # 載入 .env 環境變數
@@ -109,27 +110,49 @@ elif page == "📜 留言板":
         st.info("👉 請點擊左側欄選單回到「🔑 身分驗證」登入後即可解鎖。")
         st.stop()
 
+    # ================= 1. 發布新貼文 (主文) =================
     with st.container(border=True):
         st.subheader("✍️ 發表新貼文")
         message = st.text_area("想說點什麼？", placeholder="發布一篇新的靠北文...")
         
+        # 🌟 新增：圖片上傳元件
+        uploaded_file = st.file_uploader("📎 附上梗圖或照片 (選填)", type=["jpg", "png", "jpeg", "gif"])
+        
         if st.button("發布貼文 🚀", use_container_width=True):
-            if not message:
-                st.error("⚠️ 留言不能為空喔！")
+            # 檢查是否全空
+            if not message and not uploaded_file:
+                st.error("⚠️ 留言與圖片不能同時為空喔！")
             else:
-                with st.spinner("正在抓取鏈上公鑰、生成環簽章並請 Relayer 代付上鏈..."):
+                with st.spinner("正在處理資料與上鏈... (若有圖片需較長時間)"):
                     try:
-                        # 1. 生成專屬的 Key Image (避免同一句話重複發送，也作為唯一識別)
                         import hashlib
-                        sk_bytes = bytes.fromhex(st.session_state.ephemeral_private_key)
-                        msg_bytes = message.encode('utf-8')
-                        key_image = hashlib.sha256(sk_bytes + msg_bytes).hexdigest()
                         
-                        # 2. 將貼文與 Key Image 送交後端 Relayer
+                        final_message = message
+                        
+                        # 🌟 新增邏輯：如果有傳圖片，先打 API 上傳到 IPFS
+                        if uploaded_file:
+                            st.toast("正在將圖片上傳至 IPFS 星際檔案系統...")
+                            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                            img_res = requests.post("http://127.0.0.1:8000/upload_image", files=files)
+                            
+                            if img_res.status_code == 200:
+                                ipfs_url = img_res.json()["ipfs_url"]
+                                # ✨ 神技：巧妙利用 Markdown 語法，把圖片嵌入到留言文字中
+                                final_message += f"\n\n![image]({ipfs_url})"
+                            else:
+                                st.error("❌ 圖片上傳 IPFS 失敗！")
+                                st.stop()
+
+                        # 接下來的發文邏輯跟原本一模一樣，只是使用組合好的 final_message
+                        sk_bytes = bytes.fromhex(st.session_state.ephemeral_private_key)
+                        msg_bytes = final_message.encode('utf-8')
+                        parent_id_bytes = str(0).encode('utf-8')
+                        key_image = hashlib.sha256(sk_bytes + msg_bytes + parent_id_bytes).hexdigest()
+                        
                         res = requests.post(
                             "http://127.0.0.1:8000/wall/post",
                             json={
-                                "message": message,
+                                "message": final_message,
                                 "parent_id": 0,
                                 "key_image": key_image
                             }
@@ -138,8 +161,9 @@ elif page == "📜 留言板":
                         if res.status_code == 200:
                             tx_hash = res.json()["tx_hash"]
                             st.success(f"✅ 發文成功！您的匿名心聲已永久刻在區塊鏈上。")
-                            st.info(f"🔗 交易紀錄 (TxHash): {tx_hash}")
+                            st.info(f"🔗 TxHash: {tx_hash}")
                             st.balloons()
+                            st.rerun() # 自動重整看新貼文
                         else:
                             st.error(f"❌ 發文失敗：{res.json().get('detail')}")
                     except Exception as e:
@@ -154,7 +178,7 @@ elif page == "📜 留言板":
         if st.button("🔄 重新整理", use_container_width=True):
             st.rerun()
 
-    # 呼叫後端 API 抓取鏈上留言
+    # ================= 2. 抓取鏈上留言並進行渲染 =================
     try:
         res = requests.get("http://127.0.0.1:8000/wall/posts")
         if res.status_code == 200:
@@ -163,10 +187,67 @@ elif page == "📜 留言板":
             if not posts:
                 st.info("📭 目前牆上空空如也，趕快去搶頭香吧！")
             else:
-                for post in posts:
-                    with st.chat_message("user", avatar="🕵️‍♂️"):
-                        st.markdown(f"### {post['message']}")
-                        st.caption(f"Post ID: #{post['post_id']} | 🔗 TxHash: {post['tx_hash'][:12]}...{post['tx_hash'][-4:]}")
+                # 【新增邏輯】：將抓回來的貼文區分為「主貼文」與「回覆」
+                main_posts = [p for p in posts if p['parent_id'] == 0]
+                
+                replies_dict = {}
+                for p in posts:
+                    if p['parent_id'] != 0:
+                        if p['parent_id'] not in replies_dict:
+                            replies_dict[p['parent_id']] = []
+                        # 因為後端回傳是最新的在最上面，這裡用 insert 讓同篇貼文的舊回覆排在上面，符合閱讀習慣
+                        replies_dict[p['parent_id']].insert(0, p)
+
+                # 渲染主貼文
+                for post in main_posts:
+                    with st.container(border=True):
+                        # 顯示主貼文內容
+                        with st.chat_message("user", avatar="🕵️‍♂️"):
+                            st.markdown(f"### {post['message']}")
+                            st.caption(f"Post ID: #{post['post_id']} | 🔗 TxHash: {post['tx_hash'][:12]}...{post['tx_hash'][-4:]}")
+                        
+                        # 顯示這篇貼文的專屬回覆
+                        post_replies = replies_dict.get(post['post_id'], [])
+                        if post_replies:
+                            st.markdown("---")
+                            for reply in post_replies:
+                                with st.chat_message("user", avatar="💬"):
+                                    st.markdown(f"{reply['message']}")
+                                    st.caption(f"Reply ID: #{reply['post_id']} | 🔗 TxHash: {reply['tx_hash'][:12]}...{reply['tx_hash'][-4:]}")
+
+                        # 撰寫回覆的 UI (使用 expander 收納，避免畫面過於冗長)
+                        with st.expander(f"✏️ 回覆此貼文 (#{post['post_id']})"):
+                            # 注意：Streamlit 的表單元件必須要有 unique key，這裡用 post_id 組合
+                            reply_msg = st.text_input("輸入回覆內容", key=f"input_{post['post_id']}")
+                            if st.button("送出回覆", key=f"btn_{post['post_id']}"):
+                                if not reply_msg:
+                                    st.error("⚠️ 回覆不能為空喔！")
+                                else:
+                                    with st.spinner("正在請 Relayer 代付回覆上鏈..."):
+                                        try:
+                                            sk_bytes = bytes.fromhex(st.session_state.ephemeral_private_key)
+                                            msg_bytes = reply_msg.encode('utf-8')
+                                            
+                                            # 【關鍵防護】：把 parent_id 也加入 Key Image 雜湊
+                                            parent_id_bytes = str(post['post_id']).encode('utf-8')
+                                            key_image = hashlib.sha256(sk_bytes + msg_bytes + parent_id_bytes).hexdigest()
+                                            
+                                            res = requests.post(
+                                                "http://127.0.0.1:8000/wall/post",
+                                                json={
+                                                    "message": reply_msg,
+                                                    "parent_id": post['post_id'], # 綁定主貼文的 ID
+                                                    "key_image": key_image
+                                                }
+                                            )
+                                            
+                                            if res.status_code == 200:
+                                                st.success("✅ 回覆成功！")
+                                                st.rerun() # 重新載入畫面以顯示新回覆
+                                            else:
+                                                st.error(f"❌ 回覆失敗：{res.json().get('detail')}")
+                                        except Exception as e:
+                                            st.error(f"無法連線到伺服器：{e}")
         else:
             st.error("無法載入貼文，請確認區塊鏈節點是否正常運作。")
     except Exception as e:

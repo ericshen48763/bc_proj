@@ -2,7 +2,7 @@ import os
 import time
 import requests
 from dotenv import load_dotenv  # 新增這一行
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File  # 新增 UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.oauth2 import id_token
@@ -221,10 +221,10 @@ def register_user(req: RegisterRequest):
         if not email or not email.endswith("@gm.ntpu.edu.tw"):
             raise HTTPException(status_code=403, detail="僅限台北大學 @gm.ntpu.edu.tw 信箱註冊。")
         
-        # 2. Task 2.3：限流防洗版檢查 (5分鐘內只能註冊一次)
+        # 2. Task 2.3：限流防洗版檢查 (10秒內只能註冊一次)
         current_time = time.time()
-        if email in rate_limit_db and (current_time - rate_limit_db[email] < 300):
-            remaining = int(300 - (current_time - rate_limit_db[email]))
+        if email in rate_limit_db and (current_time - rate_limit_db[email] < 10):
+            remaining = int(10 - (current_time - rate_limit_db[email]))
             raise HTTPException(status_code=429, detail=f"註冊過於頻繁，請等待 {remaining} 秒。")
         rate_limit_db[email] = current_time
         
@@ -325,3 +325,39 @@ def get_all_posts():
         return {"status": "success", "posts": posts[::-1]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"讀取貼文失敗: {str(e)}")
+    
+# ================= 處理圖片上傳至 IPFS (Pinata) =================
+PINATA_JWT = os.getenv("PINATA_JWT")
+
+@app.post("/upload_image")
+async def upload_image(file: UploadFile = File(...)):
+    if not PINATA_JWT:
+        raise HTTPException(status_code=500, detail="伺服器未設定 PINATA_JWT 環境變數")
+
+    try:
+        # 使用 Pinata API 將檔案釘選到 IPFS
+        url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+        headers = {
+            "Authorization": f"Bearer {PINATA_JWT}"
+        }
+        
+        # 讀取前端傳來的檔案
+        file_content = await file.read()
+        files = {
+            "file": (file.filename, file_content, file.content_type)
+        }
+
+        # 發送至 Pinata
+        response = requests.post(url, files=files, headers=headers)
+        
+        if response.status_code == 200:
+            # 取得 IPFS 雜湊值 (CID)
+            cid = response.json()["IpfsHash"]
+            # 轉換成公用 Gateway 網址
+            ipfs_url = f"https://gateway.pinata.cloud/ipfs/{cid}"
+            return {"ipfs_url": ipfs_url}
+        else:
+            raise HTTPException(status_code=500, detail=f"Pinata 上傳失敗: {response.text}")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
